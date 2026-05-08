@@ -103,6 +103,14 @@ enum ClickyAnalytics {
         ])
     }
 
+    /// The realtime model clicked a screen element after the user explicitly
+    /// requested a click action.
+    static func trackElementClicked(elementLabel: String?) {
+        PostHogSDK.shared.capture("element_clicked", properties: [
+            "element_label": elementLabel ?? "unknown"
+        ])
+    }
+
     // MARK: - Errors
 
     /// An error occurred during the AI response pipeline.

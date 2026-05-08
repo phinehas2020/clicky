@@ -5,7 +5,7 @@
 
 ## Overview
 
-macOS menu bar companion app. Lives entirely in the macOS status bar (no dock icon, no main window). Clicking the menu bar icon opens a custom floating panel with companion voice controls. Uses push-to-talk (ctrl+option) to capture voice input, transcribes it via AssemblyAI streaming, and sends the transcript + a screenshot of the user's screen to Claude. Claude responds with text (streamed via SSE) and voice (ElevenLabs TTS). A blue cursor overlay can fly to and point at UI elements Claude references on any connected monitor.
+macOS menu bar companion app. Lives entirely in the macOS status bar (no dock icon, no main window). Clicking the menu bar icon opens a custom floating panel with companion voice controls. Uses push-to-talk (ctrl+option) to stream voice input directly to the selected realtime voice provider (`gpt-realtime-2` or `grok-voice-think-fast-1.0`) over websocket, then sends screen context into the same realtime session. The model responds with text and generated audio. A blue cursor overlay can fly to and point at UI elements the model references on any connected monitor.
 
 All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in the app.
 
@@ -14,26 +14,28 @@ All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in th
 - **App Type**: Menu bar-only (`LSUIElement=true`), no dock icon or main window
 - **Framework**: SwiftUI (macOS native) with AppKit bridging for menu bar panel and cursor overlay
 - **Pattern**: MVVM with `@StateObject` / `@Published` state management
-- **AI Chat**: Claude (Sonnet 4.6 default, Opus 4.6 optional) via Cloudflare Worker proxy with SSE streaming
-- **Speech-to-Text**: AssemblyAI real-time streaming (`u3-rt-pro` model) via websocket, with OpenAI and Apple Speech as fallbacks
-- **Text-to-Speech**: ElevenLabs (`eleven_flash_v2_5` model) via Cloudflare Worker proxy
+- **Realtime Voice/Chat/TTS**: Selectable realtime model provider via websocket. OpenAI Realtime uses `gpt-realtime-2`; xAI Voice uses `grok-voice-think-fast-1.0`. One session handles microphone audio input, screen-aware reasoning, text output, and generated audio output.
+- **Legacy Speech-to-Text**: AssemblyAI real-time streaming (`u3-rt-pro` model), OpenAI upload transcription, and Apple Speech remain in the codebase but are no longer the active companion hotkey path.
+- **Legacy Text-to-Speech**: ElevenLabs (`eleven_flash_v2_5` model) remains in the codebase but the active companion hotkey path uses OpenAI Realtime audio output.
 - **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support
-- **Voice Input**: Push-to-talk via `AVAudioEngine` + pluggable transcription-provider layer. System-wide keyboard shortcut via listen-only CGEvent tap.
-- **Element Pointing**: Claude embeds `[POINT:x,y:label:screenN]` tags in responses. The overlay parses these, maps coordinates to the correct monitor, and animates the blue cursor along a bezier arc to the target.
+- **Voice Input**: Push-to-talk via `AVAudioEngine` streaming PCM16 mono audio to the selected realtime provider. System-wide keyboard shortcut via listen-only CGEvent tap.
+- **Element Pointing/Clicking**: The realtime model calls `point_at_screen_element` with screenshot pixel coordinates to animate the blue cursor, or `click_screen_element` to perform a left click only when the user explicitly asks. Screenshot context includes Accessibility-derived control centers when available, and the app snaps matching point/click targets to those controls before mapping coordinates to the correct monitor. The app still accepts legacy `[POINT:x,y:label:screenN]` tags as a fallback and animates the blue cursor along a bezier arc to the target.
 - **Concurrency**: `@MainActor` isolation, async/await throughout
 - **Analytics**: PostHog via `ClickyAnalytics.swift`
 
 ### API Proxy (Cloudflare Worker)
 
-The app never calls external APIs directly. All requests go through a Cloudflare Worker (`worker/src/index.ts`) that holds the real API keys as secrets.
+The app never ships durable external API keys. For OpenAI Realtime and xAI Voice, it asks the Cloudflare Worker (`worker/src/index.ts`) for a short-lived client secret, then connects to the provider websocket with that ephemeral credential. Legacy Claude, ElevenLabs, and AssemblyAI requests still go through Worker proxy routes that hold the real API keys as secrets.
 
 | Route | Upstream | Purpose |
 |-------|----------|---------|
 | `POST /chat` | `api.anthropic.com/v1/messages` | Claude vision + streaming chat |
 | `POST /tts` | `api.elevenlabs.io/v1/text-to-speech/{voiceId}` | ElevenLabs TTS audio |
 | `POST /transcribe-token` | `streaming.assemblyai.com/v3/token` | Fetches a short-lived (480s) AssemblyAI websocket token |
+| `POST /realtime-client-secret` | `api.openai.com/v1/realtime/client_secrets` | Fetches a short-lived OpenAI Realtime client secret |
+| `POST /xai-realtime-client-secret` | `api.x.ai/v1/realtime/client_secrets` | Fetches a short-lived xAI Voice client secret |
 
-Worker secrets: `ANTHROPIC_API_KEY`, `ASSEMBLYAI_API_KEY`, `ELEVENLABS_API_KEY`
+Worker secrets: `OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `ASSEMBLYAI_API_KEY`, `ELEVENLABS_API_KEY`. The OpenAI Realtime route also tolerates a secret whose binding name starts with `sk-` for the current Clicky Worker setup.
 Worker vars: `ELEVENLABS_VOICE_ID`
 
 ### Key Architecture Decisions
@@ -44,6 +46,8 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 
 **Global Push-To-Talk Shortcut**: Background push-to-talk uses a listen-only `CGEvent` tap instead of an AppKit global monitor so modifier-based shortcuts like `ctrl + option` are detected more reliably while the app is running in the background.
 
+**Realtime Companion Pipeline**: The active hotkey path opens a fresh realtime websocket session per utterance using the selected model provider. While the hotkey is held, the app streams PCM16 mono microphone audio at 24 kHz. On release, it commits the audio buffer, attaches fresh multi-monitor screen context, and asks the selected model for audio/text output plus optional cursor-pointing or explicit click tool calls. OpenAI receives screenshot images and element centers; xAI receives screen dimensions plus Accessibility-derived element centers because the xAI Voice docs do not expose image input.
+
 **Shared URLSession for AssemblyAI**: A single long-lived `URLSession` is shared across all AssemblyAI streaming sessions (owned by the provider, not the session). Creating and invalidating a URLSession per session corrupts the OS connection pool and causes "Socket is not connected" errors after a few rapid reconnections.
 
 **Transient Cursor Mode**: When "Show Clicky" is off, pressing the hotkey fades in the cursor overlay for the duration of the interaction (recording → response → TTS → optional pointing), then fades it out automatically after 1 second of inactivity.
@@ -53,12 +57,14 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | File | Lines | Purpose |
 |------|-------|---------|
 | `leanring_buddyApp.swift` | ~89 | Menu bar app entry point. Uses `@NSApplicationDelegateAdaptor` with `CompanionAppDelegate` which creates `MenuBarPanelManager` and starts `CompanionManager`. No main window — the app lives entirely in the status bar. |
-| `CompanionManager.swift` | ~1026 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → Claude → TTS → pointing pipeline. |
+| `CompanionManager.swift` | ~1485 | Central state machine. Owns shortcut monitoring, realtime provider selection, push-to-talk capture, screen capture, legacy Claude/ElevenLabs clients, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → realtime audio + screen context → generated audio/text → pointing/clicking pipeline. |
 | `MenuBarPanelManager.swift` | ~243 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor. |
-| `CompanionPanelView.swift` | ~761 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, model picker (Sonnet/Opus), permissions UI, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
-| `OverlayWindow.swift` | ~881 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Handles cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. |
+| `CompanionPanelView.swift` | ~762 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, realtime model picker, permissions UI, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
+| `OverlayWindow.swift` | ~881 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Handles cursor animation, exact element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. |
 | `CompanionResponseOverlay.swift` | ~217 | SwiftUI view for the response text bubble and waveform displayed next to the cursor in the overlay. |
-| `CompanionScreenCaptureUtility.swift` | ~132 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
+| `CompanionScreenCaptureUtility.swift` | ~383 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display plus Accessibility-derived clickable element candidates when available. |
+| `OpenAIRealtimeCompanionClient.swift` | ~905 | Realtime voice websocket client for OpenAI and xAI. Fetches provider-specific client secrets from the Worker, streams PCM16 microphone audio, sends screen and element-candidate context, receives generated audio/text, and parses cursor-pointing/clicking function calls. |
+| `OpenAIRealtimeMicrophoneAudioRouter.swift` | ~92 | Buffers microphone PCM immediately on push-to-talk, then flushes it into the Realtime session once the websocket is ready so early speech is not lost during startup. |
 | `BuddyDictationManager.swift` | ~866 | Push-to-talk voice pipeline. Handles microphone capture via `AVAudioEngine`, provider-aware permission checks, keyboard/button dictation sessions, transcript finalization, shortcut parsing, contextual keyterms, and live audio-level reporting for waveform feedback. |
 | `BuddyTranscriptionProvider.swift` | ~100 | Protocol surface and provider factory for voice transcription backends. Resolves provider based on `VoiceTranscriptionProvider` in Info.plist — AssemblyAI, OpenAI, or Apple Speech. |
 | `AssemblyAIStreamingTranscriptionProvider.swift` | ~478 | Streaming transcription provider. Fetches temp tokens from the Cloudflare Worker, opens an AssemblyAI v3 websocket, streams PCM16 audio, tracks turn-based transcripts, and delivers finalized text on key-up. Shares a single URLSession across all sessions. |
@@ -71,10 +77,10 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `ElevenLabsTTSClient.swift` | ~81 | ElevenLabs TTS client. Sends text to the Worker proxy, plays back audio via `AVAudioPlayer`. Exposes `isPlaying` for transient cursor scheduling. |
 | `ElementLocationDetector.swift` | ~335 | Detects UI element locations in screenshots for cursor pointing. |
 | `DesignSystem.swift` | ~880 | Design system tokens — colors, corner radii, shared styles. All UI references `DS.Colors`, `DS.CornerRadius`, etc. |
-| `ClickyAnalytics.swift` | ~121 | PostHog analytics integration for usage tracking. |
+| `ClickyAnalytics.swift` | ~129 | PostHog analytics integration for usage tracking. |
 | `WindowPositionManager.swift` | ~262 | Window placement logic, Screen Recording permission flow, and accessibility permission helpers. |
 | `AppBundleConfiguration.swift` | ~28 | Runtime configuration reader for keys stored in the app bundle Info.plist. |
-| `worker/src/index.ts` | ~142 | Cloudflare Worker proxy. Three routes: `/chat` (Claude), `/tts` (ElevenLabs), `/transcribe-token` (AssemblyAI temp token). |
+| `worker/src/index.ts` | ~260 | Cloudflare Worker proxy. Routes: `/realtime-client-secret` (OpenAI Realtime client secret), `/xai-realtime-client-secret` (xAI Voice client secret), `/chat` (legacy Claude), `/tts` (legacy ElevenLabs), `/transcribe-token` (legacy AssemblyAI temp token). |
 
 ## Build & Run
 
@@ -97,6 +103,8 @@ cd worker
 npm install
 
 # Add secrets
+npx wrangler secret put OPENAI_API_KEY
+npx wrangler secret put XAI_API_KEY
 npx wrangler secret put ANTHROPIC_API_KEY
 npx wrangler secret put ASSEMBLYAI_API_KEY
 npx wrangler secret put ELEVENLABS_API_KEY

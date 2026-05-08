@@ -582,14 +582,14 @@ struct CompanionPanelView: View {
                     .foregroundColor(DS.Colors.textTertiary)
                     .frame(width: 16)
 
-                Text("Speech to Text")
+                Text("Voice Engine")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(DS.Colors.textSecondary)
             }
 
             Spacer()
 
-            Text(companionManager.buddyDictationManager.transcriptionProviderDisplayName)
+            Text(companionManager.voiceProviderDisplayName)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(DS.Colors.textTertiary)
         }
@@ -607,8 +607,9 @@ struct CompanionPanelView: View {
             Spacer()
 
             HStack(spacing: 0) {
-                modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
-                modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
+                ForEach(RealtimeCompanionModelProvider.allCases) { modelProvider in
+                    modelOptionButton(modelProvider: modelProvider)
+                }
             }
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -622,12 +623,12 @@ struct CompanionPanelView: View {
         .padding(.vertical, 4)
     }
 
-    private func modelOptionButton(label: String, modelID: String) -> some View {
-        let isSelected = companionManager.selectedModel == modelID
+    private func modelOptionButton(modelProvider: RealtimeCompanionModelProvider) -> some View {
+        let isSelected = companionManager.selectedModel == modelProvider
         return Button(action: {
-            companionManager.setSelectedModel(modelID)
+            companionManager.setSelectedModel(modelProvider)
         }) {
-            Text(label)
+            Text(modelProvider.pickerLabel)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
                 .padding(.horizontal, 10)
