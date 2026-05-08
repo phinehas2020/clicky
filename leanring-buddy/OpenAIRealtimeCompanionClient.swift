@@ -677,6 +677,15 @@ final class OpenAIRealtimeCompanionSession: @unchecked Sendable {
             }
 
             print("✅ \(modelProvider.voiceEngineDisplayName)[\(sessionLogID)]: response.done status=\(responseStatus), textChars=\(accumulatedAssistantText.count), audioBytes=\(accumulatedResponseAudioData.count), pointTarget=\(pendingPointTarget != nil), clickTarget=\(pendingClickTarget != nil)")
+
+            if responseStatus == "cancelled",
+               accumulatedAssistantText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               accumulatedResponseAudioData.isEmpty,
+               pendingPointTarget == nil,
+               pendingClickTarget == nil {
+                print("↪️ \(modelProvider.voiceEngineDisplayName)[\(sessionLogID)]: ignoring empty cancelled response.done while waiting for real response")
+                return
+            }
         }
 
         let duration = Date().timeIntervalSince(responseStartedAt ?? Date())

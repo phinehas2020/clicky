@@ -620,6 +620,7 @@ final class CompanionManager: ObservableObject {
                 handleRealtimeScreenActionsIfNeeded(
                     pointTarget: realtimeResult.pointTarget,
                     clickTarget: realtimeResult.clickTarget,
+                    userTranscriptText: userTranscriptText,
                     rawAssistantText: rawAssistantText,
                     screenCaptures: screenCaptures
                 )
@@ -762,6 +763,7 @@ final class CompanionManager: ObservableObject {
     private func handleRealtimeScreenActionsIfNeeded(
         pointTarget: OpenAIRealtimePointTarget?,
         clickTarget: OpenAIRealtimeClickTarget?,
+        userTranscriptText: String,
         rawAssistantText: String,
         screenCaptures: [CompanionScreenCapture]
     ) {
@@ -789,6 +791,11 @@ final class CompanionManager: ObservableObject {
                 clickCoordinate: CGPoint(x: clickTarget.x, y: clickTarget.y),
                 elementLabel: clickTarget.label,
                 screenNumber: clickTarget.screenNumber,
+                screenCaptures: screenCaptures
+            )
+        } else if let requestedClickLabel = extractRequestedClickLabel(from: userTranscriptText) {
+            handleDeterministicClickIntent(
+                requestedClickLabel: requestedClickLabel,
                 screenCaptures: screenCaptures
             )
         }
@@ -856,6 +863,40 @@ final class CompanionManager: ObservableObject {
 
             self.performLeftMouseClick(at: mapping.globalLocation, elementLabel: elementLabel)
         }
+    }
+
+    private func handleDeterministicClickIntent(
+        requestedClickLabel: String,
+        screenCaptures: [CompanionScreenCapture]
+    ) {
+        for (screenCaptureIndex, screenCapture) in screenCaptures.enumerated() {
+            let screenCenter = CGPoint(
+                x: CGFloat(screenCapture.screenshotWidthInPixels) / 2.0,
+                y: CGFloat(screenCapture.screenshotHeightInPixels) / 2.0
+            )
+
+            guard let candidate = bestElementCandidate(
+                matching: requestedClickLabel,
+                near: screenCenter,
+                in: screenCapture
+            ) else {
+                continue
+            }
+
+            print("🖱️ Deterministic click fallback: transcript requested \"\(requestedClickLabel)\", using AX candidate \"\(candidate.label)\" on screen \(screenCaptureIndex + 1)")
+            handleClickCoordinate(
+                clickCoordinate: CGPoint(
+                    x: CGFloat(candidate.centerXInScreenshotPixels),
+                    y: CGFloat(candidate.centerYInScreenshotPixels)
+                ),
+                elementLabel: requestedClickLabel,
+                screenNumber: screenCaptureIndex + 1,
+                screenCaptures: screenCaptures
+            )
+            return
+        }
+
+        print("🖱️ Deterministic click fallback: no AX candidate matched \"\(requestedClickLabel)\"")
     }
 
     private func mapScreenshotCoordinateToScreen(
@@ -985,19 +1026,37 @@ final class CompanionManager: ObservableObject {
     private func normalizedElementText(_ text: String) -> String {
         text
             .lowercased()
+            .replacingOccurrences(of: "unpause", with: "play")
             .replacingOccurrences(of: "ax", with: " ")
             .replacingOccurrences(of: #"[^a-z0-9]+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func normalizedElementTokens(from text: String) -> Set<String> {
-        let ignoredTokens: Set<String> = ["button", "control", "item", "field", "ax"]
+        let ignoredTokens: Set<String> = ["button", "control", "item", "field", "ax", "music"]
         return Set(
             normalizedElementText(text)
                 .split(separator: " ")
                 .map(String.init)
                 .filter { !ignoredTokens.contains($0) }
         )
+    }
+
+    private func extractRequestedClickLabel(from transcript: String) -> String? {
+        let pattern = #"\b(?:click|press|tap|hit|push)\s+(?:the\s+)?(.+?)(?:\s+(?:button|control))?\s*[\.\?!]?$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+              let match = regex.firstMatch(
+                in: transcript,
+                range: NSRange(transcript.startIndex..., in: transcript)
+              ),
+              match.numberOfRanges >= 2,
+              let labelRange = Range(match.range(at: 1), in: transcript) else {
+            return nil
+        }
+
+        let label = String(transcript[labelRange])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return label.isEmpty ? nil : label
     }
 
     private func performLeftMouseClick(at screenLocation: CGPoint, elementLabel: String?) {
